@@ -31,7 +31,28 @@ stages:
         command: 'buildAndPush'
         Dockerfile: 'Dockerfile'
         tags: 'latest'
-      
+
+- stage : Run_SonarCloud_Analysis
+  jobs:
+    - job: Analysis
+      displayName: Analysis
+      steps:
+      - checkout: self
+        fetchDepth: 0
+      - task: SonarCloudPrepare@1
+        inputs:
+          SonarCloud: 'SonarCloud'
+          organization: 'tjulianext'
+          scannerMode: 'CLI'
+          configMode: 'manual'
+          cliProjectKey: 'tjulianext_Brief_8_TJ'
+          cliProjectName: 'Brief_8_TJ'
+          cliSources: '.'
+      - task: SonarCloudAnalyze@1
+      - task: SonarCloudPublish@1
+        inputs:
+          pollingTimeoutSec: '300'
+
 - stage: Grype_test
   displayName: grype test
   condition: succeeded()
@@ -71,9 +92,15 @@ stages:
         onTimeout: 'reject'
 
 - stage: QAL_Deployment
-  displayName: Qal
-  dependsOn: Grype_test
-  condition: eq(dependencies.Grype_test.outputs['Grype_test.finalresult.gryre'],0)
+  displayName: Qal Deployment and OWASP Test
+  condition: |
+    or(
+    eq(dependencies.Grype_test.outputs['Grype_test.finalresult.gryre'],0),
+    succeeded('VerificationGrype')
+    )
+  dependsOn: 
+  - Grype_test
+  - VerificationGrype
   jobs:
   - job: QAL_Deploy
     displayName: Deploy on QAL 
@@ -96,6 +123,73 @@ stages:
         targetType: 'inline'
         script: 'sleep 45'
       
+    - task: DockerInstaller@0
+      inputs:
+        dockerVersion: '17.09.0-ce'
+        
+    - task: CmdLine@2
+      inputs:
+        script: |
+          chmod -R 777 ./
+          docker run --rm -v $(pwd):/zap/wrk/:rw -t owasp/zap2docker-stable zap-full-scan.py -t http://qalvotingapp.simplon-thomas.space:80 -x report.xml
+          true
+      displayName: "Owasp Container Scan"
+    
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          $XslPath = "./xml_to_nunit.xslt" 
+          $XmlInputPath = "report.xml"
+          $XmlOutputPath = "test-results.xml"
+          $XslTransform = New-Object System.Xml.Xsl.XslCompiledTransform
+          $XslTransform.Load($XslPath)
+          $XslTransform.Transform($XmlInputPath, $XmlOutputPath)
+      displayName: "PowerShell Script"
+    
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results'
+      inputs:
+        testResultsFormat: 'NUnit'
+        testResultsFiles: './test-results.xml'
+        mergeTestResults: true
+        failTaskOnFailedTests: true
+
+
+- stage: VerificationOWASP
+  condition: failed('Qal_Deployment')
+  dependsOn: Qal_Deployment
+  displayName: 'In waiting of validation of OWASP report' 
+  jobs:
+  - job: waitForValidation
+    displayName: Wait for external validation
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 240 # task times out in 3 days
+      inputs:
+        notifyUsers: |
+          tjulian.ext@simplonformations.onmicrosoft.com
+        instructions: 'Please validate with OWASP report'
+        onTimeout: 'reject'
+
+- stage: QAL_test
+  displayName: QAL Test reponse
+  dependsOn: 
+  - QAL_Deployment
+  - VerificationOWASP
+  condition: |
+    or(
+      succeeded('QAL_Deployment'),
+      succeeded('VerificationOWASP')
+    )
+  jobs:
+  - job: QAL_Deploy
+    displayName: Deploy on QAL 
+    pool:
+      vmImage: 'ubuntu-latest' 
+    steps:
+        
     - task: Bash@3
       name: checksitefreevote
       displayName: Test de la requête pour voter free
@@ -124,7 +218,6 @@ stages:
           exitcode=$(curl -X POST -d "vote=reset" http://qalvotingapp.simplon-thomas.space -w "%{http_code}" -o /dev/null)
           echo "##vso[task.setvariable variable=exit3]$exitcode"
 
-
     - task: CmdLine@2
       condition: eq(variables['exit3'],'200')
       displayName: test du temps de réponse de la requête de vote sur prod
@@ -147,18 +240,20 @@ stages:
         script: |
           reponseqal=$(curl -X POST -d "vote=free" http://qalvotingapp.simplon-thomas.space -w "%{time_total}" -o /dev/null)
           echo "##vso[task.setvariable variable=repqal]$reponseqal"
+
     - task: CmdLine@2
-      name : chargetest
-      displayName: Test de charge de la qal
       condition: gt(variables['repprod'],variables['repqal'])
+      displayName: Test de charge de la qal
       inputs:
         script: |
-          seq 250 | parallel --max-args 0  --jobs 20 "curl -k -iF 'vote=free' http://qalvotingapp.simplon-thomas.space"
+            seq 250 | parallel --max-args 0  --jobs 20 "curl -k -iF 'vote=free' http://qalvotingapp.simplon-thomas.space"
+
     - task: CmdLine@2
       condition: gt(variables['repprod'],variables['repqal'])
       name: waitforcharge
       inputs:
-        script: 'sleep 70'
+        script: |
+            sleep 70
 
     - task: Kubernetes@1
       condition: gt(variables['repprod'],variables['repqal'])
@@ -178,14 +273,16 @@ stages:
       name: countpod
       inputs:
         script: |
-          qalappcount=$(echo $QALPODS_KUBECTLOUTPUT | jq '.items[0].spec.replicas')
-          echo $qalappcount
-          echo "##vso[task.setvariable variable=countpods;isOutput=true]$qalappcount"
+              qalappcount=$(echo $QALPODS_KUBECTLOUTPUT | jq '.items[0].spec.replicas')
+              echo $qalappcount
+              echo "##vso[task.setvariable variable=countpods;isOutput=true]$qalappcount"
+
     - task: CmdLine@2
       condition: ne(variables['countpods'],2)
       name: scalework
       inputs:
-        script: echo 'Scaling worked'
+        script: |
+              echo 'Scaling worked'
 
     - task: Kubernetes@1
       name: deleteqal
@@ -198,17 +295,10 @@ stages:
         arguments: '-f $(System.DefaultWorkingDirectory)/kubernetes/qal/'
         secretType: 'dockerRegistry'
         containerRegistryType: 'Azure Container Registry'
-    - task: Bash@3
-      name: yourverygood
-      condition: succeeded()
-      inputs:
-        targetType: 'inline'
-        script: 'echo "QAL DELETION"'
 
-
-- stage: 'Delete_Qal'
-  condition: failed()
-  dependsOn: QAL_Deployment
+- stage: Delete_Qal
+  condition: failed('VerificationOWASP')
+  dependsOn: VerificationOWASP
   displayName: Suppression de la QAL si failed
   jobs:
     - job: Delete_QAL
@@ -226,16 +316,16 @@ stages:
           arguments: '-f $(System.DefaultWorkingDirectory)/kubernetes/qal/'
           secretType: 'dockerRegistry'
           containerRegistryType: 'Azure Container Registry'
+      
 
-
-- stage: 'Deploy_canary'
+- stage: Deploy_canary
   dependsOn:
-  - QAL_Deployment
-  condition: gt(dependencies.QAL_Deployment.outputs['QAL_Deploy.countpod.countpods'],2)
-  displayName: 'Deploy Canary Release' 
+  - QAL_test
+  condition: gt(dependencies.QAL_test.outputs['QAL_Deploy.countpod.countpods'],2)
+  displayName: Deploy Canary Release
   jobs:
-  - job: 'Deploy_canary' 
-    displayName: 'Deployment of Canary Release' 
+  - job: Deploy_canary
+    displayName: Deployment of Canary Release
     pool:
       vmImage: 'ubuntu-latest' 
     steps:
@@ -250,9 +340,10 @@ stages:
         percentage: '50'
         manifests: '**/kubernetes/canary/deployment-canary.yaml'
 
-- stage: 'ManualIntervention'
-  condition: succeeded()
-  dependsOn: Deploy_canary
+- stage: ManualInterventionCanary
+  dependsOn:
+  - Deploy_canary
+  condition: succeeded('Deploy_canary')
   displayName: 'In waiting of validation of working canary release' 
   jobs:
   - job: waitForValidation
@@ -267,12 +358,12 @@ stages:
         instructions: 'Please validate the build configuration and resume'
         onTimeout: 'reject'
 
-- stage: 'Rollback'
-  dependsOn: ManualIntervention
-  condition: failed()
+- stage: Rollback
+  dependsOn: ManualInterventionCanary
+  condition: failed('ManualInterventionCanary')
   displayName: 'Rollback due to failed manual intervention'
   jobs:
-    - job: 'DeleteCanary'
+    - job: DeleteCanary
       displayName: 'Delete canary due to malfunction'
       pool:
         vmImage: 'ubuntu-latest'
@@ -290,10 +381,10 @@ stages:
           secretType: 'dockerRegistry'
           containerRegistryType: 'Azure Container Registry'
 
-- stage: 'DeployOnProd'
-  dependsOn: ManualIntervention
-  condition: succeeded()
-  displayName: 'Deploy on Prod' 
+- stage: DeployOnProd
+  dependsOn: ManualInterventionCanary
+  condition: succeeded('ManualInterventionCanary')
+  displayName: Deploy on Prod
   jobs:
   - job: 'Deployonprod' 
     displayName: 'Deploy on Prod and delete Canary' 
